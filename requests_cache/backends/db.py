@@ -13,7 +13,7 @@
 """
 import json
 from datetime import timedelta
-from typing import Optional, Type, TypeAlias
+from typing import Iterable, Iterator, List, Optional, Type, TypeAlias
 
 from requests.cookies import RequestsCookieJar, cookiejar_from_dict
 from requests.structures import CaseInsensitiveDict
@@ -22,7 +22,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session as SA_Session
 from sqlalchemy.orm import declarative_base
 
-from ..models import CachedRequest, CachedResponse
+from ..models import AnyRequest, CachedRequest, CachedResponse
+from ..policy import ExpirationTime, get_expiration_datetime
 from . import BaseCache, BaseStorage
 
 Base: TypeAlias = declarative_base()  # type: ignore
@@ -115,9 +116,83 @@ class DBCache(BaseCache):
         Base.metadata.create_all(engine)
         session = SA_Session(engine, future=True)
 
-        self.responses = DBStorage(session, model=DBResponse, **kwargs)
+        self.responses: DBStorage = DBStorage(session, model=DBResponse, **kwargs)
         # TODO: Separate class for handling redirects
-        self.redirects = BaseStorage()  # DBStorage(session, model=DBRedirect, **kwargs)
+        # self.redirects = DBStorage(session, model=DBRedirect, **kwargs)
+
+    @property
+    def session(self) -> SA_Session:
+        return self.responses.session
+
+    # TODO
+    def delete(
+        self,
+        *keys: str,
+        expired: bool = False,
+        invalid: bool = False,
+        older_than: ExpirationTime = None,
+        requests: Iterable[AnyRequest] = None,
+    ):
+        """A more efficient implementation of :py:meth:`BaseCache.delete`"""
+        delete_keys: List[str] = list(keys) if keys else []
+        if requests:
+            delete_keys += [self.create_key(request) for request in requests]
+        if delete_keys:
+            self.responses.bulk_delete(delete_keys)
+        if expired:
+            self._delete_expired()
+        if invalid:
+            return super().delete(invalid=True)
+        if older_than:
+            self._delete_older_than(older_than)
+
+        self._prune_redirects()
+        self.responses.vacuum()
+        # self.redirects.vacuum()
+
+    def _delete_expired(self):
+        """A more efficient implementation of deleting expired responses"""
+        stmt = delete(DBResponse).where(DBResponse.expires < func.now())
+        self.session.execute(stmt)
+
+    def _delete_older_than(self, older_than: ExpirationTime):
+        """A more efficient implementation of deleting responses older than a given time"""
+        older_than_dt = get_expiration_datetime(older_than, negative_delta=True)
+        stmt = delete(DBResponse).where(DBResponse.created_at < older_than_dt)
+        self.session.execute(stmt)
+
+    def _prune_redirects(self):
+        """A more efficient implementation of removing invalid redirects"""
+        self.session.execute(
+            'DELETE FROM redirects WHERE key IN ('
+            '    SELECT redirects.key FROM redirects'
+            '    LEFT JOIN responses ON responses.key = redirects.value'
+            '    WHERE responses.key IS NULL'
+            ')'
+        )
+
+    def filter(
+        self,
+        valid: bool = True,
+        expired: bool = True,
+        invalid: bool = False,
+        older_than: ExpirationTime = None,
+    ) -> Iterator[CachedResponse]:
+        """A more efficient implementation of :py:meth:`BaseCache.filter`.
+        ``invalid`` is not supported.
+        """
+        stmt = select(DBResponse)
+        if not expired:
+            stmt = stmt.where(DBResponse.expires > func.now())
+        elif not valid:
+            stmt = stmt.where(DBResponse.expires < func.now())
+
+        if older_than:
+            older_than = get_expiration_datetime(older_than, negative_delta=True)
+            stmt = stmt.where(DBResponse.created_at < older_than)
+
+        for result in self.session.execute(stmt).all():
+            yield result[0].to_cached_response()
 
 
 class DBStorage(BaseStorage):
@@ -143,17 +218,27 @@ class DBStorage(BaseStorage):
         stmt = delete(DBResponse).where(DBResponse.key == key)
         if not self.session.execute(stmt).rowcount:
             raise KeyError
+        self.session.commit()
 
     def __iter__(self):
-        for row in self.session.execute(select(DBResponse)).all():
-            yield row
+        for result in self.session.execute(select(DBResponse)).all():
+            yield result[0]
 
     def __len__(self) -> int:
         stmt = select([func.count()]).select_from(DBResponse)
         return self.session.execute(stmt).scalar()
 
+    def bulk_delete(self, keys: Iterable[str]):
+        stmt = delete(DBResponse).where(DBResponse.key.in_(keys))
+        self.session.execute(stmt)
+        self.session.commit()
+
     def clear(self):
         self.session.execute(delete(DBResponse))
+        self.session.commit()
+
+    def vacuum(self):
+        self.session.execute('VACUUM')
 
 
 def _load_cookies(cookies_str: str) -> RequestsCookieJar:
